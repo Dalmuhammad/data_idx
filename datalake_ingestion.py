@@ -275,8 +275,8 @@ def main_etl():
     metadata_etl = read_json_s3(BUCKET_NAME, METADATA_KEY)[etl_name]
 
     # get last_success and today (date)
-    last_success = datetime.fromisoformat(metadata_etl["last_success"]).date() \
-        if metadata_etl["last_success"] is not None \
+    last_processed = datetime.fromisoformat(metadata_etl["last_processed"]).date() \
+        if metadata_etl["last_processed"] is not None \
         else (datetime.today() - timedelta(days=1)).date()
 
     today = datetime.today().date()
@@ -286,14 +286,14 @@ def main_etl():
                      last_run=datetime.now().isoformat())
 
     # daily load to s3
-    daily_load(last_success, today)
+    daily_load(last_processed, today)
 
     # auto compact
-    auto_compact(last_success, today)
+    auto_compact(last_processed, today)
 
     # update last_success
     update_metadata(BUCKET_NAME, METADATA_KEY, etl_name,
-                     last_success=datetime.now().isoformat(),
+                     las_processed=datetime.now().isoformat(),
                      start_time=start_time,
                      end_time=datetime.now().isoformat())
 

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, date
 import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
+from datalake_ingestion import update_metadata, read_json_s3
 
 BUCKET_NAME = "afdal-idx-stock-data-s3"
 
@@ -85,7 +86,6 @@ def read_df_from_s3(bucket_name, key, s3_client=None):
         raise
 
     return pd.read_parquet(BytesIO(response["Body"].read()))
-
 
 
 def upload_df_to_s3(df, bucket_name, key, s3_client=None):
@@ -277,10 +277,50 @@ def transform_to_curated(dfs:dict):
     return dfs_curated
 
 
-# if __name__ == "__main__":
-#     df_raw = load_raw(
-#         datetime.strptime("2026-08-30", "%Y-%m-%d").date(),
-#         datetime.strptime("2026-09-01", "%Y-%m-%d").date(),
-#     )
-#     df_curated = transform_to_curated(df_raw)
-#     save_curated_to_s3(df_curated)
+def main_curated():
+    METADATA_KEY = "metadata/etl_control.json"
+    etl_name = "curated_idx"
+    etl_name_prev = "datalake_idx"
+    
+    start_time = datetime.now().isoformat()
+
+    # get metadata ETL
+    metadata_all = read_json_s3(BUCKET_NAME, METADATA_KEY)
+    metadata_etl = metadata_all[etl_name]
+    metadata_etl_prev = metadata_all[etl_name_prev]
+
+    # get last_success and today (date)
+    last_processed = datetime.fromisoformat(metadata_etl["last_processed"]).date() \
+        if metadata_etl["last_processed"] is not None \
+        else datetime(2020, 1, 1).date()
+
+    prev_last_processed = (datetime.fromisoformat(
+            metadata_etl_prev["last_processed"]).date())
+
+    today = datetime.today().date()
+
+    # Constraint: curated ETL cannot process beyond previous ETL
+    end_time= min(today, prev_last_processed)
+
+    # update last_run
+    update_metadata(BUCKET_NAME, METADATA_KEY, etl_name,
+                     last_run=datetime.now().isoformat())
+
+    #curate and save
+    df_raw = load_raw(last_processed, end_time)
+    df_curated = transform_to_curated(df_raw)
+    save_curated_to_s3(df_curated)
+
+    # update last_success
+    update_metadata(BUCKET_NAME, METADATA_KEY, etl_name,
+                     last_processed=min(
+                                    datetime.fromisoformat(metadata_etl_prev["last_processed"]),
+                                    datetime.now()
+                                    ).isoformat(),
+                     start_time=start_time,
+                     end_time=datetime.now().isoformat())
+
+
+
+if __name__ == "__main__":
+    main_curated()

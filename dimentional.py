@@ -2,10 +2,13 @@ import duckdb
 import logging
 import pandas as pd
 import boto3
+import re
 
 from io import BytesIO
 from datetime import datetime, timedelta, date
 from botocore.exceptions import ClientError
+
+from datalake_ingestion import update_metadata, read_json_s3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -14,11 +17,68 @@ BUCKET_NAME = "afdal-idx-stock-data-s3"
 DIM_STOCK_KEY = "modeled/dim_stock/data.parquet"
 
 
+def get_month_list(start_date, end_date):
+    months = set()
+    current_date = start_date
+    while current_date <= end_date:
+        months.add(current_date.year * 100 + current_date.month)
+        current_date += timedelta(days=1)
+    return sorted(months)
+
+
+# S3
+def read_df_from_s3(bucket_name, key, s3_client=None):
+    s3_client = s3_client or boto3.client("s3")
+    try:
+        response = s3_client.get_object(
+            Bucket=bucket_name,
+            Key=key,
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return None
+        raise
+
+    return pd.read_parquet(BytesIO(response["Body"].read()))
+
+
 def upload_df_to_s3(df, bucket_name, key, s3_client=None):
     s3_client = s3_client or boto3.client("s3")
     buffer = BytesIO()
     df.to_parquet(buffer, index=False, engine="pyarrow")
     s3_client.put_object(Bucket=bucket_name, Key=key, Body=buffer.getvalue())
+
+
+def load_curated(start_date, end_date):
+    """Load curated data for a date range and return it as one concatenated DataFrame."""
+    months = get_month_list(start_date, end_date)
+    s3_client = boto3.client("s3")
+    dfs = {}
+
+    for i, year_month in enumerate(months):
+        month, year = year_month % 100, year_month // 100
+        mm, yyyy = f"{month:02d}", f"{year:04d}"
+
+        if i != len(months) - 1:
+            key = f"curated/idx/year={yyyy}/month={mm}/data.parquet"
+            logger.info(f"Loading curated: {key}")
+            dfs[key] = read_df_from_s3(BUCKET_NAME, key, s3_client)
+        else:
+            first_date = date(year, month, 1)
+            for current_date in pd.date_range(first_date, end_date):
+                current_date = current_date.date()
+                key = f"curated/idx/year={yyyy}/month={mm}/daily/date={current_date}/data.parquet"
+                logger.info(f"Loading curated: {key}")
+
+                df = read_df_from_s3(BUCKET_NAME, key, s3_client)
+                if df is not None:
+                    dfs[key] = df
+                else:
+                    logger.info(f"No data found: {key}")
+
+    logger.info(f"Loaded {len(dfs)} curated files")
+    return dfs
+
 
 def init_dim_sector_industry():
     #ini untuk sementara masih di-update manual mappingannya (mengikuti kebijakan IDX) dan menggunakan SDC type 1.
@@ -1036,6 +1096,7 @@ def init_dim_stock():
     )
     upload_df_to_s3(dim_stock, BUCKET_NAME, DIM_STOCK_KEY)
 
+
 def update_dim_stock(key):
     # SCD2 incremental update dim_stock
     con = _get_duckdb_connection()
@@ -1183,3 +1244,127 @@ def update_dim_stock(key):
     logger.info(f"update_dim_stock: {changed} row(s), uploading")
     # return df_stock
     upload_df_to_s3(df_stock, BUCKET_NAME, DIM_STOCK_KEY)
+
+
+def fact_stock_daily(yyyy=None, mm=None, source_df=None):
+    con = _get_duckdb_connection()
+
+    if source_df is None:
+        source = f"""
+            read_parquet(
+                's3://{BUCKET_NAME}/curated/idx/year={yyyy}/month={mm}/data.parquet'
+            )
+        """
+    else:
+        con.register("source_df", source_df)
+        source = "source_df"
+
+    return con.execute(
+        f"""
+        SELECT
+            CAST(strftime(trade_date, '%Y%m%d') AS INTEGER) AS date_key,
+            stock_code,
+            regexp_extract(
+                remarks,'00([A-Z][0-9]{{3}})',1
+            ) AS idx_ic_code,
+            previous_price,
+            open_price,
+            first_trade_price,
+            high_price,
+            low_price,
+            close_price,
+            price_change,
+            volume,
+            trading_value,
+            frequency,
+            foreign_buy,
+            foreign_sell,
+            non_regular_volume,
+            non_regular_value,
+            non_regular_frequency
+        FROM {source}
+        """
+    ).df()
+
+
+def increment_dim_fact(start_date, end_date):
+    dfs = load_curated(start_date,end_date)
+    months = get_month_list(start_date,end_date)
+
+    # Increment dim_stock (SDC type 2)
+    key_dim_stock = list(dfs.keys())
+    update_dim_stock(key_dim_stock)
+
+    # Increment fact_stock_daily
+    for key,value in dfs.items():
+        # months = get_month_list(start_date, end_date)
+        df_daily = []
+        if "daily" in key:
+            df_daily.append(value)
+            continue
+
+        yyyy = re.search(r"year=(\d{4})", key).group(1)
+        mm = re.search(r"month=(\d{2})", key).group(1)
+        fact_key = f"modeled/fact_stock_daily/year={yyyy}/month={mm}/data.parquet"
+        df = fact_stock_daily(yyyy,mm)
+        upload_df_to_s3(df, BUCKET_NAME, fact_key)
+        logger.info(f"Uploading: {fact_key} (DONE)")
+
+    if df_daily:
+        df_daily = pd.concat(df_daily, ignore_index=True)    
+        month, year = months[-1] % 100, months[-1] // 100
+        mm, yyyy = f"{month:02d}", f"{year:04d}"    
+        fact_key = f"modeled/fact_stock_daily/year={yyyy}/month={mm}/data.parquet"
+        df = fact_stock_daily(yyyy,mm, df_daily)
+        upload_df_to_s3(df, BUCKET_NAME, fact_key)
+        logger.info(f"Uploading: {fact_key} (DONE)")
+
+
+def main_dimentional():
+    METADATA_KEY = "metadata/etl_control.json"
+    etl_name = "dwh_idx"
+    etl_name_prev = "curated_idx"
+    
+    start_time = datetime.now().isoformat()
+
+    # get metadata ETL
+    metadata_all = read_json_s3(BUCKET_NAME, METADATA_KEY)
+    metadata_etl = metadata_all[etl_name]
+    metadata_etl_prev = metadata_all[etl_name_prev]
+
+    # get last_success and today (date)
+    last_processed = datetime.fromisoformat(metadata_etl["last_processed"]).date() \
+        if metadata_etl["last_processed"] is not None \
+        else datetime(2020, 1, 1).date()
+
+    prev_last_processed = (datetime.fromisoformat(
+            metadata_etl_prev["last_processed"]).date())
+
+    today = datetime.today().date()
+
+    # Constraint: curated ETL cannot process beyond previous ETL
+    end_time= min(today, prev_last_processed)
+
+    # update last_run
+    update_metadata(BUCKET_NAME, METADATA_KEY, etl_name,
+                        last_run=datetime.now().isoformat())
+
+    # Init dim_sector_industry and dim_date only for the first time
+    if metadata_etl["last_processed"] is None:
+        init_dim_sector_industry()
+        init_dim_date()
+
+    #ETL fact_stock_daily
+    increment_dim_fact(last_processed, end_time)
+
+    # update last_success
+    update_metadata(BUCKET_NAME, METADATA_KEY, etl_name,
+                    last_processed=min(
+                                datetime.fromisoformat(metadata_etl_prev["last_processed"]),
+                                datetime.now()
+                                ).isoformat(),
+                    start_time=start_time,
+                    end_time=datetime.now().isoformat())
+
+if __name__ == "__main__":
+    main_dimentional()
