@@ -1,83 +1,51 @@
-import duckdb
 import logging
-import pandas as pd
-import boto3
 import re
+from collections import defaultdict
+from functools import lru_cache
 
-from io import BytesIO
-from datetime import datetime, timedelta, date
-from botocore.exceptions import ClientError
+import duckdb
+import pandas as pd
 
-from datalake_ingestion import update_metadata, read_json_s3
+from idx_common import (
+    BUCKET_NAME,
+    list_layer_keys,
+    object_exists,
+    run_stage,
+    setup_logging,
+    upload_df_to_s3,
+)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-BUCKET_NAME = "afdal-idx-stock-data-s3"
 DIM_STOCK_KEY = "modeled/dim_stock/data.parquet"
 
 
-def get_month_list(start_date, end_date):
-    months = set()
-    current_date = start_date
-    while current_date <= end_date:
-        months.add(current_date.year * 100 + current_date.month)
-        current_date += timedelta(days=1)
-    return sorted(months)
+def s3_uri(key):
+    return f"s3://{BUCKET_NAME}/{key}"
 
 
-# S3
-def read_df_from_s3(bucket_name, key, s3_client=None):
-    s3_client = s3_client or boto3.client("s3")
-    try:
-        response = s3_client.get_object(
-            Bucket=bucket_name,
-            Key=key,
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
-            return None
-        raise
-
-    return pd.read_parquet(BytesIO(response["Body"].read()))
+def sql_paths(keys):
+    return ", ".join(f"'{s3_uri(k)}'" for k in keys)
 
 
-def upload_df_to_s3(df, bucket_name, key, s3_client=None):
-    s3_client = s3_client or boto3.client("s3")
-    buffer = BytesIO()
-    df.to_parquet(buffer, index=False, engine="pyarrow")
-    s3_client.put_object(Bucket=bucket_name, Key=key, Body=buffer.getvalue())
+@lru_cache(maxsize=1)
+def get_duckdb_connection():
+    """Satu koneksi DuckDB untuk seluruh run (INSTALL/LOAD httpfs + secret cuma sekali)."""
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs;")
+    con.execute("LOAD httpfs;")
+    con.execute("""
+        CREATE OR REPLACE SECRET (
+            TYPE S3,
+            PROVIDER credential_chain
+        );
+    """)
+    return con
 
 
-def load_curated(start_date, end_date):
-    """Load curated data for a date range and return it as one concatenated DataFrame."""
-    months = get_month_list(start_date, end_date)
-    s3_client = boto3.client("s3")
-    dfs = {}
-
-    for i, year_month in enumerate(months):
-        month, year = year_month % 100, year_month // 100
-        mm, yyyy = f"{month:02d}", f"{year:04d}"
-
-        if i != len(months) - 1:
-            key = f"curated/idx/year={yyyy}/month={mm}/data.parquet"
-            logger.info(f"Loading curated: {key}")
-            dfs[key] = read_df_from_s3(BUCKET_NAME, key, s3_client)
-        else:
-            first_date = date(year, month, 1)
-            for current_date in pd.date_range(first_date, end_date):
-                current_date = current_date.date()
-                key = f"curated/idx/year={yyyy}/month={mm}/daily/date={current_date}/data.parquet"
-                logger.info(f"Loading curated: {key}")
-
-                df = read_df_from_s3(BUCKET_NAME, key, s3_client)
-                if df is not None:
-                    dfs[key] = df
-                else:
-                    logger.info(f"No data found: {key}")
-
-    logger.info(f"Loaded {len(dfs)} curated files")
-    return dfs
+def copy_to_s3_parquet(con, select_sql, key):
+    """Tulis hasil query langsung ke S3 sebagai parquet (tanpa lewat pandas -> tipe kolom tetap sesuai DDL Athena)."""
+    con.execute(f"COPY ({select_sql}) TO '{s3_uri(key)}' (FORMAT PARQUET)")
 
 
 def init_dim_sector_industry():
@@ -998,6 +966,7 @@ def init_dim_sector_industry():
     df_sector_industry = pd.DataFrame(idx_ic_flat_list)
     upload_df_to_s3(df_sector_industry,BUCKET_NAME,key)
 
+
 def init_dim_date():
     # Rentangnya bisa disesuaikan, dan cukup sekali diinitial load aja.
     start_date = "2020-01-01"
@@ -1006,37 +975,33 @@ def init_dim_date():
 
     dim_date = pd.DataFrame({"Date": date_range})
 
-    dim_date["date_key"] = dim_date["Date"].dt.strftime("%Y%m%d").astype(int)
+    # tipe eksplisit supaya cocok dengan DDL Athena (date_key BIGINT, year/month/quarter INT)
+    dim_date["date_key"] = dim_date["Date"].dt.strftime("%Y%m%d").astype("int64")
     dim_date["date"] = dim_date["Date"].dt.date
-    dim_date["year"] = dim_date["Date"].dt.year
-    dim_date["month"] = dim_date["Date"].dt.month
-    dim_date["quarter"] = dim_date["Date"].dt.quarter
+    dim_date["year"] = dim_date["Date"].dt.year.astype("int32")
+    dim_date["month"] = dim_date["Date"].dt.month.astype("int32")
+    dim_date["quarter"] = dim_date["Date"].dt.quarter.astype("int32")
     dim_date["day_name"] = dim_date["Date"].dt.day_name()
 
     dim_date = dim_date.drop(columns=["Date"])
 
-    key = "modeled/dim_date/data.parquet"
-    upload_df_to_s3(dim_date, BUCKET_NAME, key)
+    upload_df_to_s3(dim_date, BUCKET_NAME, "modeled/dim_date/data.parquet")
 
-def _get_duckdb_connection():
-    con = duckdb.connect()
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
-    con.execute("""
-        CREATE OR REPLACE SECRET (
-            TYPE S3,
-            PROVIDER credential_chain
-        );
-    """)
-    return con
 
-def init_dim_stock():
-    # One-time init: bangun dim_stock SCD2 dari seluruh histori curated (2020 s.d. bulan terakhir yang sudah tercompact)
-    con = _get_duckdb_connection()
-    source = f"s3://{BUCKET_NAME}/curated/idx/year=*/month=*/data.parquet"
+def init_dim_stock(keys):
+    """One-time init: bangun dim_stock SCD2 dari seluruh histori curated (keys = semua file curated).
 
-    dim_stock = con.execute(
-        f"""
+    Konvensi interval: valid_to = (valid_from versi berikutnya) - 1 hari, NULL untuk versi aktif.
+    Jadi interval selalu menyambung tanpa gap/overlap: date BETWEEN valid_from AND COALESCE(valid_to, date).
+    """
+    if not keys:
+        logger.warning("init_dim_stock: nggak ada file curated, skip")
+        return
+
+    con = get_duckdb_connection()
+    source = f"read_parquet([{sql_paths(keys)}], union_by_name = true)"
+
+    sql = f"""
         WITH changes AS (
             SELECT
                 trade_date,
@@ -1048,12 +1013,10 @@ def init_dim_stock():
                     ),
                     TRUE
                 ) AS name_changed
-            FROM read_parquet('{source}', hive_partitioning = true)
---            WHERE year >= 2020
---              AND (year < 2026 OR (year = 2026 AND CAST(month AS INTEGER) <= 7))
-        ), last_date AS (
-            SELECT MAX(trade_date) as last_update_date
-            FROM changes
+            FROM {source}
+        ),
+        last_date AS (
+            SELECT MAX(trade_date) AS d FROM changes
         ),
         versions AS (
             SELECT *,
@@ -1068,303 +1031,208 @@ def init_dim_stock():
                 stock_code,
                 version,
                 FIRST(stock_name ORDER BY trade_date) AS stock_name,
-                MIN(trade_date) AS valid_from,
-                MAX(trade_date) AS valid_to
+                MIN(trade_date) AS valid_from
             FROM versions
             GROUP BY stock_code, version
         )
         SELECT
             stock_code,
             stock_name,
-            valid_from,
-            CASE
-                WHEN ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY valid_from DESC) = 1
-                THEN NULL ELSE valid_to
-            END AS valid_to,
-            (ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY valid_from DESC) = 1)::INTEGER AS is_active,
-            (SELECT *
-            FROM last_date
-            ) as last_update_date
+            CAST(valid_from AS DATE) AS valid_from,
+            CAST((LEAD(valid_from) OVER w) - 1 AS DATE) AS valid_to,
+            (LEAD(valid_from) OVER w IS NULL)::INTEGER AS is_active,
+            CAST((SELECT d FROM last_date) AS DATE) AS last_update_date
         FROM history
+        WINDOW w AS (PARTITION BY stock_code ORDER BY valid_from)
         ORDER BY stock_code, valid_from
-        """
-    ).df()
+    """
+    copy_to_s3_parquet(con, sql, DIM_STOCK_KEY)
 
-    logger.info(
-        f"init_dim_stock: generated {len(dim_stock)} rows for "
-        f"{dim_stock['stock_code'].nunique()} stocks"
-    )
-    upload_df_to_s3(dim_stock, BUCKET_NAME, DIM_STOCK_KEY)
+    n_rows, n_stocks = con.execute(
+        f"SELECT COUNT(*), COUNT(DISTINCT stock_code) FROM read_parquet('{s3_uri(DIM_STOCK_KEY)}')"
+    ).fetchone()
+    logger.info(f"init_dim_stock: generated {n_rows} rows for {n_stocks} stocks")
 
 
-def update_dim_stock(key):
-    # SCD2 incremental update dim_stock
-    con = _get_duckdb_connection()
-    dim_stock_path = f"s3://{BUCKET_NAME}/{DIM_STOCK_KEY}"
-    new_data_path = ", ".join(f"'s3://{BUCKET_NAME}/{path}'" for path in key)
-    # new_data_path = (
-    #     f"s3://{BUCKET_NAME}/{key}"
-    # )
+def update_dim_stock(keys):
+    """SCD2 incremental dim_stock. Hanya upload kalau ada perubahan (nama baru / saham baru) atau tipe kolom perlu diperbaiki."""
+    if not keys:
+        logger.info("update_dim_stock: nggak ada file curated, skip")
+        return
+    if not object_exists(BUCKET_NAME, DIM_STOCK_KEY):
+        raise RuntimeError("dim_stock belum ada. Jalankan init_dim_stock() dulu (first run).")
 
-    df_stock = con.execute(
-        f"""
+    con = get_duckdb_connection()
+    dim_path = s3_uri(DIM_STOCK_KEY)
+    new_data = f"read_parquet([{sql_paths(keys)}], union_by_name = true)"
+
+    # Semua "titik awal versi" (stock_code, stock_name, valid_from) = yang sudah ada + titik ganti nama baru.
+    # valid_to & is_active dihitung ulang dari urutan valid_from, jadi konsisten dengan init_dim_stock.
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE dim_new AS
         WITH dim_current AS (
-            SELECT * FROM read_parquet('{dim_stock_path}')
+            SELECT
+                stock_code,
+                stock_name,
+                CAST(valid_from AS DATE) AS valid_from,
+                is_active,
+                CAST(last_update_date AS DATE) AS last_update_date
+            FROM read_parquet('{dim_path}')
         ),
         current_active AS (
-            SELECT stock_code, stock_name AS current_name, valid_from AS current_valid_from, last_update_date
+            SELECT stock_code, stock_name AS current_name
             FROM dim_current
             WHERE is_active = 1
         ),
-        get_last_update AS (
-            SELECT MAX(last_update_date) as last_update_date
-            FROM current_active
+        last_upd AS (
+            SELECT MAX(last_update_date) AS d FROM dim_current
         ),
-        new_changes AS (
+        new_rows AS (
             SELECT
-                trade_date,
-                stock_code,
-                stock_name,
+                n.trade_date,
+                n.stock_code,
+                n.stock_name,
+                -- baris pertama tiap saham dibandingkan dengan nama aktif eksisting (NULL kalau saham baru)
                 COALESCE(
-                    stock_name != LAG(stock_name) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date
-                    ),
-                    TRUE
-                ) AS name_changed
-            FROM read_parquet([{new_data_path}], union_by_name = True)
-            WHERE trade_date>(SELECT * FROM get_last_update)
+                    LAG(n.stock_name) OVER (PARTITION BY n.stock_code ORDER BY n.trade_date),
+                    c.current_name
+                ) AS prev_name
+            FROM {new_data} n
+            LEFT JOIN current_active c ON c.stock_code = n.stock_code
+            WHERE n.trade_date > (SELECT d FROM last_upd)
         ),
-        new_versions AS (
-            SELECT *,
-                SUM(CAST(name_changed AS INTEGER)) OVER (
-                    PARTITION BY stock_code ORDER BY trade_date
-                    ROWS UNBOUNDED PRECEDING
-                ) AS version
-            FROM new_changes
+        new_starts AS (
+            SELECT stock_code, stock_name, trade_date AS valid_from
+            FROM new_rows
+            WHERE prev_name IS NULL OR stock_name != prev_name
         ),
-        new_segments AS (
-            SELECT
-                stock_code,
-                version,
-                FIRST(stock_name ORDER BY trade_date) AS stock_name,
-                MIN(trade_date) AS seg_start,
-                MAX(trade_date) AS seg_end,
-                MAX(version) OVER (PARTITION BY stock_code) AS max_version
-            FROM new_versions
-            GROUP BY stock_code, version
-        ),
-        merged AS (
-            -- segmen pertama tiap stock di batch baru, digabung sama record aktif eksisting
-            SELECT
-                s.stock_code,
-                s.stock_name,
-                CASE WHEN s.stock_name = c.current_name THEN c.current_valid_from ELSE s.seg_start END AS valid_from,
-                CASE WHEN s.version = s.max_version THEN NULL ELSE s.seg_end END AS valid_to
-            FROM new_segments s
-            LEFT JOIN current_active c ON s.stock_code = c.stock_code
-            WHERE s.version = 1
-
+        all_starts AS (
+            SELECT stock_code, stock_name, valid_from FROM dim_current
             UNION ALL
-
-            -- ganti nama yang kejadian di tengah2 batch baru
-            SELECT
-                s.stock_code,
-                s.stock_name,
-                s.seg_start AS valid_from,
-                CASE WHEN s.version = s.max_version THEN NULL ELSE s.seg_end END AS valid_to
-            FROM new_segments s
-            WHERE s.version > 1
-
-            UNION ALL
-
-            -- tutup record aktif lama kalau nama udah beda dari H1 batch baru
-            SELECT
-                c.stock_code,
-                c.current_name AS stock_name,
-                c.current_valid_from AS valid_from,
-                s.seg_start - 1 AS valid_to
-            FROM new_segments s
-            JOIN current_active c ON s.stock_code = c.stock_code
-            WHERE s.version = 1 AND s.stock_name != c.current_name
-
-            UNION ALL
-
-            -- stock tanpa data baru di batch ini (suspend dll): biarin apa adanya
-            SELECT
-                c.stock_code,
-                c.current_name AS stock_name,
-                c.current_valid_from AS valid_from,
-                NULL AS valid_to
-            FROM current_active c
-            WHERE NOT EXISTS (
-                SELECT 1 FROM new_segments s WHERE s.stock_code = c.stock_code
-            )
-        ),
-        final_active AS (
-            SELECT
-                stock_code,
-                stock_name,
-                valid_from,
-                valid_to,
-                (ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY valid_from DESC) = 1)::INTEGER AS is_active
-            FROM merged
+            SELECT stock_code, stock_name, valid_from FROM new_starts
         )
-        SELECT stock_code, stock_name, valid_from, valid_to, is_active FROM final_active
-        UNION ALL
-        SELECT stock_code, stock_name, valid_from, valid_to, is_active FROM dim_current WHERE is_active = 0
-        ORDER BY stock_code, valid_from
-        """
-    ).df()
-    # cek ada perubahan beneran atau engga, sebelum upload
-    changed = con.execute(
-        """
+        SELECT
+            stock_code,
+            stock_name,
+            valid_from,
+            CAST((LEAD(valid_from) OVER w) - 1 AS DATE) AS valid_to,
+            (LEAD(valid_from) OVER w IS NULL)::INTEGER AS is_active
+        FROM all_starts
+        WINDOW w AS (PARTITION BY stock_code ORDER BY valid_from)
+    """)
+
+    # ada perubahan beneran atau engga?
+    changed = con.execute(f"""
         SELECT COUNT(*) FROM (
-            (SELECT * FROM df_stock EXCEPT 
-                SELECT stock_code, stock_name, valid_from, valid_to, is_active 
-                FROM read_parquet(?))
+            (SELECT * FROM dim_new
+             EXCEPT
+             SELECT stock_code, stock_name, CAST(valid_from AS DATE), CAST(valid_to AS DATE), CAST(is_active AS INTEGER)
+             FROM read_parquet('{dim_path}'))
             UNION ALL
-            (SELECT stock_code, stock_name, valid_from, valid_to, is_active 
-            FROM read_parquet(?) 
-            EXCEPT SELECT * FROM df_stock)
+            (SELECT stock_code, stock_name, CAST(valid_from AS DATE), CAST(valid_to AS DATE), CAST(is_active AS INTEGER)
+             FROM read_parquet('{dim_path}')
+             EXCEPT
+             SELECT * FROM dim_new)
         )
-        """,
-        [dim_stock_path, dim_stock_path],
-    ).fetchone()[0]
+    """).fetchone()[0]
 
-    if changed == 0:
-        logger.info(f"update_dim_stock: no changes, skip upload")
-        return 
+    # file lama (versi pandas) bisa menyimpan tanggal sebagai TIMESTAMP -> Athena (DDL: DATE) gagal baca. Paksa tulis ulang.
+    existing_types = {
+        row[0]: row[1] for row in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{dim_path}')").fetchall()
+    }
+    schema_ok = all(existing_types.get(c) == "DATE" for c in ("valid_from", "valid_to", "last_update_date"))
 
-    df_last_update = con.execute(
-            f"""
-                SELECT max(trade_date) as last_update FROM read_parquet([{new_data_path}], union_by_name = True)
-            """).fetchone()[0]
+    if changed == 0 and schema_ok:
+        logger.info("update_dim_stock: no changes, skip upload")
+        return
 
-    df_stock["last_update_date"] = df_last_update
-    logger.info(f"update_dim_stock: {changed} row(s), uploading")
-    # return df_stock
-    upload_df_to_s3(df_stock, BUCKET_NAME, DIM_STOCK_KEY)
+    last_update = con.execute(f"SELECT MAX(trade_date) FROM {new_data}").fetchone()[0]
+    if last_update is None:
+        logger.info("update_dim_stock: data baru kosong, skip upload")
+        return
 
-
-def fact_stock_daily(yyyy=None, mm=None, source_df=None):
-    con = _get_duckdb_connection()
-
-    if source_df is None:
-        source = f"""
-            read_parquet(
-                's3://{BUCKET_NAME}/curated/idx/year={yyyy}/month={mm}/data.parquet'
-            )
-        """
-    else:
-        con.register("source_df", source_df)
-        source = "source_df"
-
-    return con.execute(
+    reason = f"{changed} row(s) changed" if changed else "fix tipe kolom"
+    logger.info(f"update_dim_stock: {reason}, uploading")
+    copy_to_s3_parquet(
+        con,
         f"""
+        SELECT stock_code, stock_name, valid_from, valid_to, is_active,
+               CAST('{last_update}' AS DATE) AS last_update_date
+        FROM dim_new
+        ORDER BY stock_code, valid_from
+        """,
+        DIM_STOCK_KEY,
+    )
+
+
+def fact_select(source):
+    """SELECT untuk fact_stock_daily. Tipe di-cast eksplisit supaya cocok dengan DDL Athena."""
+    return f"""
         SELECT
             CAST(strftime(trade_date, '%Y%m%d') AS INTEGER) AS date_key,
             stock_code,
-            regexp_extract(
-                remarks,'00([A-Z][0-9]{{3}})',1
-            ) AS idx_ic_code,
-            previous_price,
-            open_price,
-            first_trade_price,
-            high_price,
-            low_price,
-            close_price,
-            price_change,
-            volume,
-            trading_value,
-            frequency,
-            foreign_buy,
-            foreign_sell,
-            non_regular_volume,
-            non_regular_value,
-            non_regular_frequency
+            NULLIF(regexp_extract(remarks, '00([A-Z][0-9]{{3}})', 1), '') AS idx_ic_code,
+            CAST(previous_price AS DOUBLE) AS previous_price,
+            CAST(open_price AS DOUBLE) AS open_price,
+            CAST(first_trade_price AS DOUBLE) AS first_trade_price,
+            CAST(high_price AS DOUBLE) AS high_price,
+            CAST(low_price AS DOUBLE) AS low_price,
+            CAST(close_price AS DOUBLE) AS close_price,
+            CAST(price_change AS DOUBLE) AS price_change,
+            CAST(volume AS BIGINT) AS volume,
+            CAST(trading_value AS DOUBLE) AS trading_value,
+            CAST(frequency AS BIGINT) AS frequency,
+            CAST(foreign_buy AS BIGINT) AS foreign_buy,
+            CAST(foreign_sell AS BIGINT) AS foreign_sell,
+            CAST(non_regular_volume AS BIGINT) AS non_regular_volume,
+            CAST(non_regular_value AS DOUBLE) AS non_regular_value,
+            CAST(non_regular_frequency AS BIGINT) AS non_regular_frequency
         FROM {source}
-        """
-    ).df()
+    """
 
 
-def increment_dim_fact(start_date, end_date):
-    dfs = load_curated(start_date,end_date)
-    months = get_month_list(start_date,end_date)
+def build_fact(keys):
+    """Rebuild fact_stock_daily per bulan dari SEMUA file curated bulan itu (bulan berjalan = gabungan seluruh daily)."""
+    con = get_duckdb_connection()
 
-    # Increment dim_stock (SDC type 2)
-    key_dim_stock = list(dfs.keys())
-    update_dim_stock(key_dim_stock)
+    keys_by_month = defaultdict(list)
+    for key in keys:
+        m = re.search(r"year=(\d{4})/month=(\d{2})", key)
+        keys_by_month[(m.group(1), m.group(2))].append(key)
 
-    # Increment fact_stock_daily
-    for key,value in dfs.items():
-        # months = get_month_list(start_date, end_date)
-        df_daily = []
-        if "daily" in key:
-            df_daily.append(value)
-            continue
-
-        yyyy = re.search(r"year=(\d{4})", key).group(1)
-        mm = re.search(r"month=(\d{2})", key).group(1)
+    for (yyyy, mm), month_keys in sorted(keys_by_month.items()):
+        source = f"read_parquet([{sql_paths(month_keys)}], union_by_name = true)"
         fact_key = f"modeled/fact_stock_daily/year={yyyy}/month={mm}/data.parquet"
-        df = fact_stock_daily(yyyy,mm)
-        upload_df_to_s3(df, BUCKET_NAME, fact_key)
-        logger.info(f"Uploading: {fact_key} (DONE)")
-
-    if df_daily:
-        df_daily = pd.concat(df_daily, ignore_index=True)    
-        month, year = months[-1] % 100, months[-1] // 100
-        mm, yyyy = f"{month:02d}", f"{year:04d}"    
-        fact_key = f"modeled/fact_stock_daily/year={yyyy}/month={mm}/data.parquet"
-        df = fact_stock_daily(yyyy,mm, df_daily)
-        upload_df_to_s3(df, BUCKET_NAME, fact_key)
-        logger.info(f"Uploading: {fact_key} (DONE)")
+        copy_to_s3_parquet(con, fact_select(source), fact_key)
+        logger.info(f"Uploading: {fact_key} (DONE, {len(month_keys)} source file)")
 
 
-def main_dimentional():
-    METADATA_KEY = "metadata/etl_control.json"
-    etl_name = "dwh_idx"
-    etl_name_prev = "curated_idx"
-    
-    start_time = datetime.now().isoformat()
-
-    # get metadata ETL
-    metadata_all = read_json_s3(BUCKET_NAME, METADATA_KEY)
-    metadata_etl = metadata_all[etl_name]
-    metadata_etl_prev = metadata_all[etl_name_prev]
-
-    # get last_success and today (date)
-    last_processed = datetime.fromisoformat(metadata_etl["last_processed"]).date() \
-        if metadata_etl["last_processed"] is not None \
-        else datetime(2020, 1, 1).date()
-
-    prev_last_processed = (datetime.fromisoformat(
-            metadata_etl_prev["last_processed"]).date())
-
-    today = datetime.today().date()
-
-    # Constraint: curated ETL cannot process beyond previous ETL
-    end_time= min(today, prev_last_processed)
-
-    # update last_run
-    update_metadata(BUCKET_NAME, METADATA_KEY, etl_name,
-                        last_run=datetime.now().isoformat())
-
-    # Init dim_sector_industry and dim_date only for the first time
-    if metadata_etl["last_processed"] is None:
+def dimensional(start_date, end_date, first_run):
+    # Init dim_sector_industry dan dim_date hanya sekali (first run)
+    if first_run:
         init_dim_sector_industry()
         init_dim_date()
 
-    #ETL fact_stock_daily
-    increment_dim_fact(last_processed, end_time)
+    # full_month_daily=True: fact bulan berjalan harus dibangun dari SELURUH daily bulan itu, bukan cuma yang baru
+    keys = list_layer_keys("curated", start_date, end_date, full_month_daily=True)
+    if not keys:
+        logger.warning("Nggak ada file curated di rentang ini, nothing to do")
+        return
 
-    # update last_success
-    update_metadata(BUCKET_NAME, METADATA_KEY, etl_name,
-                    last_processed=min(
-                                datetime.fromisoformat(metadata_etl_prev["last_processed"]),
-                                datetime.now()
-                                ).isoformat(),
-                    start_time=start_time,
-                    end_time=datetime.now().isoformat())
+    # dim_stock (SCD type 2)
+    if first_run:
+        init_dim_stock(keys)
+    else:
+        update_dim_stock(keys)
+
+    # fact_stock_daily
+    build_fact(keys)
+
+
+def main_dimentional():
+    run_stage("dwh_idx", dimensional, prev_etl_name="curated_idx")
+
 
 if __name__ == "__main__":
+    setup_logging()
     main_dimentional()
