@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(level: int = logging.INFO) -> None:
     logging.basicConfig(level=level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logging.getLogger().setLevel(level)
 
 
 # --------------------------------------------------------------------------- time
@@ -188,8 +189,8 @@ def run_stage(
     if prev_etl_name:
         prev_ts = metadata[prev_etl_name]["last_processed"]
         if prev_ts is None:
-            raise RuntimeError(f"{prev_etl_name} belum pernah sukses, {etl_name} nggak bisa jalan")
-        upper = min(upper, parse_ts(prev_ts))  # nggak boleh melewati stage sebelumnya
+            raise RuntimeError(f"{prev_etl_name} belum pernah sukses, {etl_name} tidak bisa jalan")
+        upper = min(upper, parse_ts(prev_ts))  # tidak boleh melewati stage sebelumnya
     end_date = upper.date()
 
     update_metadata(BUCKET_NAME, METADATA_KEY, etl_name, last_run=started, message="RUNNING")

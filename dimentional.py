@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from collections import defaultdict
 from functools import lru_cache
@@ -30,10 +31,26 @@ def sql_paths(keys):
 
 @lru_cache(maxsize=1)
 def get_duckdb_connection():
-    """Satu koneksi DuckDB untuk seluruh run (INSTALL/LOAD httpfs + secret cuma sekali)."""
+    """Satu koneksi DuckDB untuk seluruh run.
+ 
+    Lokal (tanpa env var): extension di-INSTALL (download) kalau belum ada.
+    Docker/Lambda: set DUCKDB_EXTENSION_DIR (extension sudah di-bake ke image, nggak download saat runtime)
+    dan DUCKDB_HOME_DIR=/tmp (filesystem Lambda read-only selain /tmp).
+    """
+    ext_dir = os.getenv("DUCKDB_EXTENSION_DIR")
+    home_dir = os.getenv("DUCKDB_HOME_DIR")
+ 
     con = duckdb.connect()
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
+    if home_dir:
+        con.execute(f"SET home_directory='{home_dir}'")
+    if ext_dir:
+        con.execute(f"SET extension_directory='{ext_dir}'")
+ 
+    for ext in ("httpfs", "aws"):  # aws = provider credential_chain untuk secret S3
+        if not ext_dir:
+            con.execute(f"INSTALL {ext}")
+        con.execute(f"LOAD {ext}")
+ 
     con.execute("""
         CREATE OR REPLACE SECRET (
             TYPE S3,
