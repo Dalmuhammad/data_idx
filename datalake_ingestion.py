@@ -17,12 +17,14 @@ from idx_common import (
     run_stage,
     setup_logging,
     upload_df_to_s3,
+    get_zapi_key,
 )
 
 logger = logging.getLogger(__name__)
 
 IDX_URL = "https://www.idx.co.id/primary/TradingSummary/GetStockSummary"
-MAX_RETRY = 5
+ZAPI_URL = "https://api.zapi.ink/v1/finance:idx/stock-summary"
+MAX_IDX_RETRY = 2
 IMPERSONATE = os.getenv("IDX_IMPERSONATE", "safari")
 IDX_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -44,65 +46,97 @@ def create_session():
         return cloudscraper.create_scraper()
  
  
-def get_idx_data(start_date: date, end_date: date = None, session=None):
-    """Ambil trading summary IDX per hari. Kirim `session` yang sama untuk banyak hari supaya cookie/challenge dipakai ulang."""
+def fetch_from_idx(target_date: date, session) -> pd.DataFrame:
+    """Mencoba fetch langsung ke endpoint internal IDX."""
+    params = {
+        "length": 9999,
+        "start": 0,
+        "date": target_date.strftime("%Y-%m-%d"),
+    }
+    
+    for attempt in range(MAX_IDX_RETRY):
+        try:
+            response = session.get(IDX_URL, params=params, headers=IDX_HEADERS, timeout=7)
+            
+            if response.status_code == 200:
+                raw_data = response.json().get("data", [])
+                df = pd.DataFrame(raw_data)
+                logger.info(f"[IDX Direct] {target_date} - OK ({len(df)} rows)")
+                return df
+            
+            logger.warning(f"[IDX Direct] {target_date} - HTTP {response.status_code} (Attempt {attempt+1}/{MAX_IDX_RETRY})")
+            
+            if response.status_code == 403:
+                # IP AWS kemungkinan besar langsung kena Cloudflare block
+                break
+                
+        except Exception as e:
+            logger.warning(f"[IDX Direct] {target_date} - Error: {e}")
+            
+        if attempt < MAX_IDX_RETRY - 1:
+            time.sleep(1) # Delay singkat sebelum retry
+            
+    return pd.DataFrame()
+
+def fetch_from_zapi(target_date: date) -> pd.DataFrame:
+    """Fallback fetch menggunakan ZAPI."""
+    params = {
+        "length": "5000",
+        "start": "0",
+        "date": target_date.strftime("%Y%m%d"), # ZAPI format YYYYMMDD
+        "code": ""
+    }
+    # Ambil ZAPI Key dari SSM / Cache
+    zapi_key = get_zapi_key()
+    headers = {"x-api-key": zapi_key}
+    
+    try:
+        import requests
+        response = requests.get(ZAPI_URL, params=params, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            res_json = response.json()
+            raw_data = res_json.get("data", {}).get("data", [])
+            df = pd.DataFrame(raw_data)
+            logger.info(f"[ZAPI Fallback] {target_date} - OK ({len(df)} rows)")
+            return df
+        else:
+            logger.error(f"[ZAPI Fallback] {target_date} - HTTP {response.status_code}: {response.text[:100]}")
+    except Exception as e:
+        logger.error(f"[ZAPI Fallback] {target_date} - Error: {e}")
+        
+    return pd.DataFrame()
+
+def get_idx_data(start_date: date, end_date: date = None, session=None) -> pd.DataFrame:
+    """Ambil trading summary IDX. 
+    Menggunakan IDX direct sebagai sumber utama, dan otomatis fallback ke ZAPI jika gagal/terblokir.
+    """
     if end_date is None:
         end_date = start_date
- 
+
     session = session or create_session()
     dates = pd.date_range(start=start_date, end=end_date)
- 
     all_data = []
+
     for current_date in dates:
-        params = {
-            "length": 9999,
-            "start": 0,
-            "date": current_date.strftime("%Y-%m-%d"),
-        }
-        fetched_ok = False
- 
-        # Retry maksimal MAX_RETRY kali
-        for attempt in range(MAX_RETRY):
-            try:
-                response = session.get(IDX_URL, params=params, headers=IDX_HEADERS, timeout=30)
-                if response.status_code == 200:
-                    df_idx = pd.DataFrame(response.json()["data"])
-                    if not df_idx.empty:
-                        all_data.append(df_idx)
-                    logger.info(f"{current_date.date()} - OK - {len(df_idx)} rows")
-                    fetched_ok = True
-                    break
-                elif response.status_code in (403, 429, 503):
-                    # 403 = biasanya bot-block Cloudflare (sering sementara) -> backoff lalu session baru
-                    wait = min(60, 3 * (2 ** attempt)) + random.uniform(0, 2)
-                    logger.warning(
-                        f"{current_date.date()} - HTTP {response.status_code} "
-                        f"(server={response.headers.get('server')}, cf-mitigated={response.headers.get('cf-mitigated')}). "
-                        f"Retry dalam {wait:.1f} detik..."
-                    )
-                    if attempt == 0:
-                        logger.warning(f"Response body: {response.text[:200]!r}")
-                    time.sleep(wait)
-                    if response.status_code == 403:
-                        session = create_session()
-                else:
-                    logger.error(f"{current_date.date()} - Request gagal: {response.status_code}")
-                    break
- 
-            except Exception as e:
-                wait = min(60, 3 * (2 ** attempt)) + random.uniform(0, 2)
-                logger.warning(f"{current_date.date()} - Error: {e}. Retry dalam {wait:.1f} detik...")
-                time.sleep(wait)
- 
-        if not fetched_ok:
-            # Semua retry gagal (bukan sekadar libur/weekend dengan data kosong) -> stop ETL
-            raise RuntimeError(
-                f"Gagal fetch data IDX untuk {current_date.date()} setelah {MAX_RETRY}x percobaan"
-            )
- 
-        # Jeda normal antar request
-        time.sleep(random.uniform(2, 4))
- 
+        dt = current_date.date()
+        
+        # 1. Coba fetch dari IDX Direct
+        df = fetch_from_idx(dt, session)
+        
+        # 2. Fallback ke ZAPI jika IDX Direct gagal/kosong dan bukan weekend
+        if df.empty and dt.weekday() < 5:
+            logger.info(f"{dt} - Switching to ZAPI fallback...")
+            df = fetch_from_zapi(dt)
+
+        if not df.empty:
+            all_data.append(df)
+        else:
+            logger.warning(f"{dt} - Tidak ada data yang berhasil ditarik.")
+
+        # Jeda antar request agar ramah API
+        time.sleep(random.uniform(0.5, 1.5))
+
     return pd.concat(all_data, ignore_index=True) if all_data else pd.DataFrame()
 
 
@@ -152,6 +186,11 @@ def daily_load(start_date, end_date):
         df = get_idx_data(d)
         key = f"raw/idx/year={d.year:04d}/month={d.month:02d}/daily/date={d}/data.parquet"
         logger.info(f"{key} - jumlah: {len(df)}")
+
+        # Jika weekday (Senin-Jumat) tapi data kosong dan data bukan hari ini, raise RuntimeError agar ETL FAILED & metadata TIDAK ter-update!
+        today = date.today()
+        if len(df) == 0 and d < today and d.weekday() < 5:
+            raise RuntimeError(f"Gagal mengambil data IDX/ZAPI untuk tanggal {d} (0 rows). ETL dihentikan.")
         if len(df) > 0:
             upload_df_to_s3(df, BUCKET_NAME, key)
 

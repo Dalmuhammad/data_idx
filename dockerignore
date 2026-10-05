@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.ipynb
+.ipynb_checkpoints/
+.git/
+.env
+_orig/
+idx_probe.py
+init_metadata_etl.py

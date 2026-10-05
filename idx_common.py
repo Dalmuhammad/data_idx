@@ -212,3 +212,34 @@ def run_stage(
         start_time=started, end_time=now().isoformat(),
         message="SUCCESS",
     )
+
+
+# Cache untuk warm-start Lambda
+_ZAPI_KEY_CACHE = None
+def get_zapi_key() -> str:
+    """Mengambil ZAPI Key dari AWS SSM Parameter Store atau dari Environment Variable langsung."""
+    global _ZAPI_KEY_CACHE
+
+    if _ZAPI_KEY_CACHE:
+        return _ZAPI_KEY_CACHE
+
+    # 1. Cek jika ZAPI_KEY langsung diset di Environment Variable (untuk lokal/testing)
+    if os.getenv("ZAPI_KEY"):
+        _ZAPI_KEY_CACHE = os.getenv("ZAPI_KEY")
+        return _ZAPI_KEY_CACHE
+
+    # 2. Ambil dari SSM Parameter Store jika ZAPI_KEY_SSM diset
+    ssm_param_name = os.getenv("ZAPI_KEY_SSM", "/idx/zapi_key")
+    try:
+        ssm = boto3.client("ssm")
+        response = ssm.get_parameter(
+            Name=ssm_param_name,
+            WithDecryption=True
+        )
+        _ZAPI_KEY_CACHE = response["Parameter"]["Value"]
+        return _ZAPI_KEY_CACHE
+    except Exception as e:
+        # Fallback error logger jika tidak ditemukan
+        import logging
+        logging.getLogger(__name__).error(f"Gagal mengambil ZAPI_KEY dari SSM ({ssm_param_name}): {e}")
+        return ""
